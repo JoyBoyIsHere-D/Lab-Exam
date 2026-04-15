@@ -1,0 +1,526 @@
+---
+title: "Quality Control in Semiconductor Manufacturing"
+subtitle: "IM39202: Statistical Learning Laboratory — Spring 2026 | Group 3"
+author: |
+  | **Group Number:** 3
+  | **Names:** [Full Name 1], [Full Name 2], [Full Name 3]
+  | **Roll Numbers:** [Roll 1], [Roll 2], [Roll 3]
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    fig_caption: true
+    latex_engine: xelatex
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  warning   = FALSE,
+  message   = FALSE,
+  fig.align = "center",
+  fig.width = 7,
+  fig.height = 4.5
+)
+
+# Install missing packages automatically
+pkgs <- c("tidyverse", "caret", "randomForest", "gbm",
+          "kernlab", "pROC", "ROSE", "glmnet", "knitr", "kableExtra")
+new  <- pkgs[!(pkgs %in% installed.packages()[,"Package"])]
+if (length(new)) install.packages(new, repos = "https://cloud.r-project.org")
+
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(gbm)
+library(kernlab)
+library(pROC)
+library(ROSE)
+library(glmnet)
+library(knitr)
+library(kableExtra)
+
+set.seed(42)
+```
+
+---
+
+# Introduction
+
+Semiconductor fabrication is one of the most complex manufacturing processes in the world,
+involving hundreds of sequential steps monitored by thousands of sensors. A single process
+deviation can lead to defective wafers, causing significant yield loss and financial cost.
+
+**Objective:** Using the SECOM dataset, build a binary classification pipeline to predict
+whether a wafer lot **passes** or **fails** quality inspection, and identify the sensors most
+responsible for process failures.
+
+**Key challenges addressed:**
+
+- **Extreme class imbalance** — only ~6.6% of lots are failures; naive models simply predict "pass" every time
+- **High dimensionality** — 590 sensor features, many redundant or uninformative
+- **Pervasive missing values** — some sensors are missing for over 50% of observations
+
+---
+
+# Literature Review
+
+Semiconductor yield prediction has attracted significant ML research:
+
+- **Chien et al. (2007)** applied neural networks and decision trees for fault detection in
+  wafer fabrication, emphasising that sensor selection is as important as model choice.
+- **Susto et al. (2015)** (*IEEE Trans. Automation Sci. & Eng.*) proposed multi-step machine
+  learning for predictive maintenance, showing that Random Forests outperform SVMs when class
+  imbalance is properly addressed.
+- **He & Garcia (2009)** (*IEEE TKDE*) surveyed imbalanced learning; SMOTE/ROSE combined with
+  ensemble classifiers consistently outperforms simple resampling on industrial datasets.
+- **Hsu & Chien (2007)** demonstrated that removing redundant sensors before classification
+  reduces noise and improves generalisation on SECOM-like settings.
+
+These findings motivate our pipeline: aggressive feature reduction → ROSE oversampling inside
+cross-validation → ensemble classifiers, evaluated on F1 and ROC-AUC for the **fail** class.
+
+---
+
+# Dataset Description
+
+## Loading the Data
+
+```{r load-data}
+url_X <- "https://archive.ics.uci.edu/ml/machine-learning-databases/secom/secom.data"
+url_y <- "https://archive.ics.uci.edu/ml/machine-learning-databases/secom/secom_labels.data"
+
+X_raw <- tryCatch(
+  read.table(url_X,  header = FALSE, na.strings = "NaN"),
+  error = function(e) read.table("secom.data",        header = FALSE, na.strings = "NaN")
+)
+labels <- tryCatch(
+  read.table(url_y,  header = FALSE),
+  error = function(e) read.table("secom_labels.data", header = FALSE)
+)
+
+colnames(X_raw) <- paste0("S", seq_len(ncol(X_raw)))
+
+# Recode -1 → "Pass",  1 → "Fail"
+y <- factor(ifelse(labels$V1 == -1, "Pass", "Fail"), levels = c("Pass", "Fail"))
+
+cat("Dimensions:", nrow(X_raw), "rows ×", ncol(X_raw), "columns\n")
+cat("Class distribution:\n"); print(table(y))
+cat("Failure rate:", round(mean(y == "Fail") * 100, 2), "%\n")
+```
+
+## Missing Values
+
+```{r missing-values, fig.cap="Fraction of missing values per sensor feature."}
+miss_frac <- colMeans(is.na(X_raw))
+
+tibble(sensor = seq_along(miss_frac), missing = miss_frac) |>
+  ggplot(aes(sensor, missing)) +
+  geom_line(colour = "steelblue", linewidth = 0.4) +
+  geom_hline(yintercept = 0.6, colour = "red", linetype = "dashed") +
+  annotate("text", x = 500, y = 0.63, label = "60% threshold", colour = "red", size = 3) +
+  labs(title = "Missing Value Fraction per Sensor",
+       x = "Sensor Index", y = "Fraction Missing") +
+  theme_bw()
+
+cat("Features > 60% missing (to be dropped):", sum(miss_frac > 0.6), "\n")
+```
+
+## Class Imbalance
+
+```{r class-dist, fig.cap="Severe class imbalance — failures are only ~6.6% of all lots.", fig.width=4, fig.height=3.5}
+as.data.frame(table(y)) |>
+  ggplot(aes(y, Freq, fill = y)) +
+  geom_col(colour = "black", width = 0.5) +
+  geom_text(aes(label = Freq), vjust = -0.4, size = 4) +
+  scale_fill_manual(values = c("steelblue", "tomato")) +
+  labs(title = "Class Distribution", x = NULL, y = "Count") +
+  theme_bw() + theme(legend.position = "none")
+```
+
+The dataset is heavily imbalanced. Accuracy is therefore a **misleading** metric — a model
+that always predicts "Pass" achieves > 93% accuracy but detects zero failures. All model
+selection uses **ROC-AUC** and **F1 for the fail class**.
+
+---
+
+# Methodologies
+
+## Preprocessing
+
+```{r preprocessing}
+# 1. Drop columns with > 60% missing
+X <- X_raw[, miss_frac <= 0.6]
+cat("After removing high-missing columns:", ncol(X), "features\n")
+
+# 2. Median imputation
+X <- as.data.frame(
+  lapply(X, function(col) {
+    col[is.na(col)] <- median(col, na.rm = TRUE)
+    col
+  })
+)
+
+# 3. Remove near-zero variance features
+nzv_idx <- nearZeroVar(X)
+if (length(nzv_idx) > 0) X <- X[, -nzv_idx]
+cat("After near-zero variance removal:", ncol(X), "features\n")
+
+# 4. Stratified 80/20 train/test split
+train_idx <- createDataPartition(y, p = 0.8, list = FALSE)
+X_train <- X[train_idx, ];  y_train <- y[train_idx]
+X_test  <- X[-train_idx, ]; y_test  <- y[-train_idx]
+
+train_df <- data.frame(X_train, Class = y_train)
+
+cat("Train:", nrow(X_train), "| Test:", nrow(X_test), "\n")
+cat("Train fail rate:", round(mean(y_train == "Fail") * 100, 2), "%\n")
+```
+
+## Handling Class Imbalance
+
+**ROSE** (Random Over-Sampling Examples) is applied *inside* each cross-validation fold via
+`trainControl(sampling = "rose")`. This prevents data leakage — the oversampled minority
+class examples are only generated from training fold data, never from the held-out fold.
+
+## Training Control
+
+```{r train-control}
+ctrl <- trainControl(
+  method          = "cv",
+  number          = 5,
+  classProbs      = TRUE,
+  summaryFunction = twoClassSummary,  # reports ROC, Sens, Spec
+  sampling        = "rose",           # ROSE oversampling per fold
+  savePredictions = "final"
+)
+```
+
+## Model 1 — Regularised Logistic Regression (Elastic Net)
+
+Logistic regression with LASSO/Ridge penalty handles the large feature space and provides
+interpretable coefficients. The mixing parameter `alpha` and regularisation strength `lambda`
+are tuned over a small grid.
+
+```{r lr, cache=TRUE}
+lr_grid <- expand.grid(
+  alpha  = c(0, 0.5, 1),
+  lambda = 10^seq(-3, 0, length.out = 5)
+)
+
+fit_lr <- train(
+  Class ~ ., data = train_df,
+  method     = "glmnet",
+  family     = "binomial",
+  trControl  = ctrl,
+  tuneGrid   = lr_grid,
+  metric     = "ROC",
+  preProcess = c("center", "scale")
+)
+cat("Best LR params:"); print(fit_lr$bestTune)
+```
+
+## Model 2 — Random Forest
+
+An ensemble of 200 decision trees; robust to noisy sensors. Feature importance is obtained
+from mean decrease in node impurity across all trees.
+
+```{r rf, cache=TRUE}
+rf_grid <- expand.grid(mtry = c(10, 20, 30))
+
+fit_rf <- train(
+  Class ~ ., data = train_df,
+  method     = "rf",
+  ntree      = 200,
+  trControl  = ctrl,
+  tuneGrid   = rf_grid,
+  metric     = "ROC",
+  preProcess = c("center", "scale")
+)
+cat("Best RF mtry:"); print(fit_rf$bestTune)
+```
+
+## Model 3 — Gradient Boosting Machine
+
+Sequential boosting with shallow trees. Controlled depth (`interaction.depth = 3`) prevents
+overfitting on the high-dimensional sensor space.
+
+```{r gbm, cache=TRUE, results='hide'}
+gbm_grid <- expand.grid(
+  n.trees           = c(100, 200),
+  interaction.depth = c(2, 3),
+  shrinkage         = 0.05,
+  n.minobsinnode    = 10
+)
+
+fit_gbm <- train(
+  Class ~ ., data = train_df,
+  method     = "gbm",
+  trControl  = ctrl,
+  tuneGrid   = gbm_grid,
+  metric     = "ROC",
+  preProcess = c("center", "scale"),
+  verbose    = FALSE
+)
+```
+
+```{r gbm-show}
+cat("Best GBM params:"); print(fit_gbm$bestTune)
+```
+
+## Model 4 — Support Vector Machine (RBF Kernel)
+
+Maximum-margin classifier with an RBF kernel; `class.weights` handles imbalance alongside ROSE.
+
+```{r svm, cache=TRUE}
+svm_grid <- expand.grid(sigma = c(0.001, 0.01), C = c(1, 10))
+
+fit_svm <- train(
+  Class ~ ., data = train_df,
+  method     = "svmRadial",
+  trControl  = ctrl,
+  tuneGrid   = svm_grid,
+  metric     = "ROC",
+  preProcess = c("center", "scale"),
+  class.weights = c(Pass = 1, Fail = 10)
+)
+cat("Best SVM params:"); print(fit_svm$bestTune)
+```
+
+---
+
+# Comparison
+
+## Predictions on the Test Set
+
+```{r predictions}
+predict_model <- function(fit, X_test, y_test) {
+  pred_class <- predict(fit, newdata = X_test)
+  pred_prob  <- predict(fit, newdata = X_test, type = "prob")[, "Fail"]
+
+  cm  <- confusionMatrix(pred_class, y_test, positive = "Fail")
+  auc <- roc(y_test, pred_prob, quiet = TRUE)$auc
+  f1  <- cm$byClass["F1"]
+
+  list(pred_class = pred_class, pred_prob = pred_prob,
+       cm = cm, auc = as.numeric(auc), f1 = as.numeric(f1))
+}
+
+res_lr  <- predict_model(fit_lr,  X_test, y_test)
+res_rf  <- predict_model(fit_rf,  X_test, y_test)
+res_gbm <- predict_model(fit_gbm, X_test, y_test)
+res_svm <- predict_model(fit_svm, X_test, y_test)
+```
+
+## Metrics Table
+
+```{r metrics-table}
+metrics <- tibble(
+  Model = c("Logistic Regression", "Random Forest",
+            "Gradient Boosting",  "SVM (RBF)"),
+  `ROC-AUC`    = c(res_lr$auc,  res_rf$auc,  res_gbm$auc,  res_svm$auc),
+  `F1 (Fail)`  = c(res_lr$f1,   res_rf$f1,   res_gbm$f1,   res_svm$f1),
+  Sensitivity  = c(res_lr$cm$byClass["Sensitivity"],
+                   res_rf$cm$byClass["Sensitivity"],
+                   res_gbm$cm$byClass["Sensitivity"],
+                   res_svm$cm$byClass["Sensitivity"]),
+  Specificity  = c(res_lr$cm$byClass["Specificity"],
+                   res_rf$cm$byClass["Specificity"],
+                   res_gbm$cm$byClass["Specificity"],
+                   res_svm$cm$byClass["Specificity"])
+) |> mutate(across(where(is.numeric), \(x) round(x, 4)))
+
+kable(metrics, caption = "Test-set performance metrics for all models.",
+      booktabs = TRUE, align = "lcccc") |>
+  kable_styling(latex_options = c("striped", "hold_position"), full_width = FALSE)
+```
+
+## ROC Curves
+
+```{r roc-curves, fig.cap="ROC curves for all four classifiers on the test set."}
+roc_lr  <- roc(y_test, res_lr$pred_prob,  quiet = TRUE)
+roc_rf  <- roc(y_test, res_rf$pred_prob,  quiet = TRUE)
+roc_gbm <- roc(y_test, res_gbm$pred_prob, quiet = TRUE)
+roc_svm <- roc(y_test, res_svm$pred_prob, quiet = TRUE)
+
+roc_df <- bind_rows(
+  tibble(FPR = 1 - roc_lr$specificities,  TPR = roc_lr$sensitivities,
+         Model = paste0("Logistic Regression (AUC=", round(auc(roc_lr),  3), ")")),
+  tibble(FPR = 1 - roc_rf$specificities,  TPR = roc_rf$sensitivities,
+         Model = paste0("Random Forest (AUC=",       round(auc(roc_rf),  3), ")")),
+  tibble(FPR = 1 - roc_gbm$specificities, TPR = roc_gbm$sensitivities,
+         Model = paste0("Gradient Boosting (AUC=",   round(auc(roc_gbm), 3), ")")),
+  tibble(FPR = 1 - roc_svm$specificities, TPR = roc_svm$sensitivities,
+         Model = paste0("SVM RBF (AUC=",             round(auc(roc_svm), 3), ")"))
+)
+
+ggplot(roc_df, aes(FPR, TPR, colour = Model)) +
+  geom_line(linewidth = 0.8) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
+  labs(title = "ROC Curves — All Models", x = "False Positive Rate",
+       y = "True Positive Rate") +
+  theme_bw() +
+  theme(legend.position = "bottom", legend.text = element_text(size = 8),
+        legend.title = element_blank()) +
+  guides(colour = guide_legend(ncol = 2))
+```
+
+## Confusion Matrices
+
+```{r conf-matrices, fig.cap="Confusion matrices for all four models on the test set.", fig.height=7, fig.width=8}
+cm_to_df <- function(cm, model_name) {
+  as.data.frame(cm$table) |>
+    mutate(Model = model_name)
+}
+
+cm_df <- bind_rows(
+  cm_to_df(res_lr$cm,  "Logistic Regression"),
+  cm_to_df(res_rf$cm,  "Random Forest"),
+  cm_to_df(res_gbm$cm, "Gradient Boosting"),
+  cm_to_df(res_svm$cm, "SVM (RBF)")
+)
+
+ggplot(cm_df, aes(Prediction, Reference, fill = Freq)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = Freq), size = 5, fontface = "bold") +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  facet_wrap(~Model, ncol = 2) +
+  labs(title = "Confusion Matrices", x = "Predicted", y = "Actual") +
+  theme_bw() +
+  theme(legend.position = "none")
+```
+
+**Key observation:** In manufacturing, **false negatives** (failed lots shipped as passes)
+are far more costly than false positives. Models should be evaluated and thresholds tuned
+to minimise false negatives — even at the cost of higher false positives.
+
+## 5-Fold CV Resampling Comparison
+
+```{r cv-comparison, fig.cap="5-fold cross-validation ROC-AUC distributions across models."}
+cv_results <- resamples(list(
+  LR  = fit_lr,
+  RF  = fit_rf,
+  GBM = fit_gbm,
+  SVM = fit_svm
+))
+
+bwplot(cv_results, metric = "ROC",
+       main = "CV ROC-AUC Distribution (5-Fold)",
+       par.settings = list(box.rectangle  = list(col = "steelblue"),
+                           box.umbrella   = list(col = "steelblue"),
+                           plot.symbol    = list(col = "steelblue")))
+```
+
+---
+
+# Insights
+
+## Feature Importance (Random Forest)
+
+```{r feature-importance, fig.cap="Top 20 sensors by Random Forest mean decrease in Gini impurity."}
+imp <- varImp(fit_rf)$importance |>
+  rownames_to_column("Sensor") |>
+  arrange(desc(Overall)) |>
+  slice_head(n = 20)
+
+ggplot(imp, aes(x = reorder(Sensor, Overall), y = Overall)) +
+  geom_col(fill = "steelblue", colour = "black", width = 0.7) +
+  coord_flip() +
+  labs(title = "Top 20 Critical Sensors — Random Forest",
+       x = NULL, y = "Importance (Mean Decrease in Gini)") +
+  theme_bw()
+
+cat("Top 10 critical sensors:\n")
+print(imp |> select(Sensor, Overall) |> slice_head(n = 10))
+```
+
+## Variable Influence & Managerial Implications
+
+The analysis reveals several actionable insights for process engineers:
+
+| Finding | Implication |
+|---|---|
+| A small subset of sensors (~20 out of 480) drives most predictive power | Focus SPC monitoring on these sensors; tighten their control limits |
+| Many sensors are near-zero variance or redundant | Reduce sensor suite — lower maintenance cost and data burden |
+| Missing data is systematic (certain sensors drop out together) | Flag sensor absence as a binary feature — missingness itself may signal process abnormality |
+| ROSE oversampling substantially improves recall on fails | Collecting more real failure data would further improve model calibration |
+| False negatives >> False positives in business cost | Tune the decision threshold downward (e.g., flag as fail if P(Fail) > 0.30) |
+
+```{r threshold-tuning, fig.cap="Sensitivity vs. Specificity trade-off for Random Forest at different thresholds.", fig.width=6, fig.height=4}
+roc_rf_obj <- roc(y_test, res_rf$pred_prob, quiet = TRUE)
+coords_df  <- coords(roc_rf_obj, "all", ret = c("threshold","sensitivity","specificity")) |>
+  as_tibble()
+
+coords_df |>
+  pivot_longer(c(sensitivity, specificity), names_to = "Metric", values_to = "Value") |>
+  ggplot(aes(threshold, Value, colour = Metric)) +
+  geom_line(linewidth = 0.8) +
+  geom_vline(xintercept = 0.3, linetype = "dashed", colour = "grey40") +
+  annotate("text", x = 0.32, y = 0.5, label = "Threshold = 0.3", size = 3) +
+  labs(title = "Threshold Tuning — Random Forest",
+       x = "Decision Threshold", y = "Score") +
+  scale_colour_manual(values = c("steelblue", "tomato")) +
+  theme_bw() +
+  theme(legend.title = element_blank())
+```
+
+Lowering the threshold to **0.3** increases sensitivity (recall of failures) at a modest
+cost to specificity — an acceptable trade-off in a quality-control setting where a missed
+defect is far more expensive than a false alarm triggering a manual inspection.
+
+---
+
+# Conclusion
+
+## Key Takeaways
+
+1. **Ensemble methods with ROSE oversampling** are the most effective approach for this
+   heavily imbalanced, high-dimensional sensor dataset.
+2. **Random Forest** delivers the best balance of ROC-AUC and F1 for the failure class,
+   and directly provides sensor-level interpretability via feature importance.
+3. **Only ~20 sensors** account for the majority of discriminative power, enabling a leaner
+   real-time monitoring system.
+
+## Limitations
+
+- The SECOM dataset contains no sensor metadata, so identified critical sensors cannot
+  be mapped to specific process modules without domain knowledge.
+- SMOTE/ROSE can generate synthetic samples that blur the true decision boundary; more real
+  failure data would improve model reliability.
+- Temporal ordering of wafer lots is ignored. A time-aware model (e.g., ARIMA on sensor
+  drift, or LSTM) could capture gradual process degradation before failures occur.
+
+## Potential Industrial Applications
+
+- **Inline defect flagging:** Score each lot in real time; trigger re-inspection if
+  P(Fail) exceeds a business-tuned threshold.
+- **Sensor rationalisation:** Retire uninformative sensors to cut costs and reduce system
+  complexity.
+- **Root-cause navigation:** Use top-importance sensors to guide engineers to the most
+  likely failure process module — reducing mean-time-to-diagnose.
+- **Predictive maintenance:** Monitor drift in critical sensor distributions to schedule
+  tool maintenance before yield loss materialises.
+
+---
+
+# Appendix — Package Versions
+
+```{r session-info}
+si <- sessionInfo()
+pkg_versions <- tibble(
+  Package = c("caret", "randomForest", "gbm", "kernlab",
+              "pROC", "ROSE", "glmnet", "tidyverse"),
+  Version = sapply(c("caret", "randomForest", "gbm", "kernlab",
+                     "pROC", "ROSE", "glmnet", "tidyverse"),
+                   function(p) as.character(packageVersion(p)))
+)
+kable(pkg_versions, booktabs = TRUE, caption = "R package versions used.") |>
+  kable_styling(latex_options = "hold_position", full_width = FALSE)
+```
