@@ -7,17 +7,17 @@ author: |
   | **Roll Numbers:** [Roll 1], [Roll 2], [Roll 3]
 date: "`r Sys.Date()`"
 output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    number_sections: true
   pdf_document:
     toc: true
     toc_depth: 2
     number_sections: true
     fig_caption: true
     latex_engine: xelatex
-  html_document:
-    toc: true
-    toc_float: true
-    theme: flatly
-    number_sections: true
 ---
 
 ```{r setup, include=FALSE}
@@ -94,17 +94,9 @@ cross-validation → ensemble classifiers, evaluated on F1 and ROC-AUC for the *
 ## Loading the Data
 
 ```{r load-data}
-url_X <- "https://archive.ics.uci.edu/ml/machine-learning-databases/secom/secom.data"
-url_y <- "https://archive.ics.uci.edu/ml/machine-learning-databases/secom/secom_labels.data"
-
-X_raw <- tryCatch(
-  read.table(url_X,  header = FALSE, na.strings = "NaN"),
-  error = function(e) read.table("secom.data",        header = FALSE, na.strings = "NaN")
-)
-labels <- tryCatch(
-  read.table(url_y,  header = FALSE),
-  error = function(e) read.table("secom_labels.data", header = FALSE)
-)
+# Place secom.data and secom_labels.data in: C:/Users/Jayanshu Jena/Desktop/SL LAB/Lab Exam
+X_raw  <- read.table("secom.data",        header = FALSE, na.strings = "NaN")
+labels <- read.table("secom_labels.data", header = FALSE)
 
 colnames(X_raw) <- paste0("S", seq_len(ncol(X_raw)))
 
